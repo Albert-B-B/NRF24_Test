@@ -25,6 +25,8 @@
 /* USER CODE BEGIN Includes */
 #include "nrf24.h"
 #include "stm32g4xx_hal.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,6 +36,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* Set to 0 for TX test mode, 1 for RX test mode */
+#define NRF24_TEST_MODE_RX  1
 
 /* USER CODE END PD */
 
@@ -45,7 +50,9 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+static char     uart_buf[80];
+static uint32_t tx_count = 0;
+static uint32_t rx_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,6 +63,91 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* --- Minimal UART2 driver (direct register access, no HAL UART required) --- */
+/* PA2 = USART2_TX (AF7), PA3 = USART2_RX (AF7) — already configured by MX_GPIO_Init */
+static void UART2_Init(void)
+{
+    /* Enable USART2 peripheral clock (PCLK1 = 170 MHz) */
+    RCC->APB1ENR1 |= RCC_APB1ENR1_USART2EN;
+    USART2->CR1 = 0;
+    USART2->CR2 = 0;
+    USART2->CR3 = 0;
+    /* BRR = PCLK1 / BaudRate = 170 000 000 / 115 200 ≈ 1477 */
+    USART2->BRR = 1477U;
+    /* Enable TX and USART */
+    USART2->CR1 = USART_CR1_TE | USART_CR1_UE;
+}
+
+static void UART2_Print(const char *str)
+{
+    while (*str) {
+        while (!(USART2->ISR & USART_ISR_TXE_TXFNF));
+        USART2->TDR = (uint8_t)(*str++);
+    }
+}
+
+/* Redirect printf → USART2 via newlib weak hook */
+int __io_putchar(int ch)
+{
+    while (!(USART2->ISR & USART_ISR_TXE_TXFNF));
+    USART2->TDR = (uint8_t)ch;
+    return ch;
+}
+
+/* Dump key nRF24L01+ registers to UART to verify SPI and config */
+static void nrf24_PrintRegisters(void)
+{
+    uint8_t addr[5];
+    uint8_t r;
+    UART2_Print("--- nRF24L01+ register dump ---\r\n");
+
+    r = nrf24_ReadRegister(0x00);
+    snprintf(uart_buf, sizeof(uart_buf), "  CONFIG     0x00 = 0x%02X", r);
+    UART2_Print(uart_buf);
+    if (r == 0xFF) UART2_Print(" !! 0xFF: SPI not responding - check wiring/VCC !!\r\n");
+    else           UART2_Print(" (0x0F=RX ok, 0x0E=TX ok)\r\n");
+
+    r = nrf24_ReadRegister(0x01);
+    snprintf(uart_buf, sizeof(uart_buf), "  EN_AA      0x01 = 0x%02X  (expect 0x00)\r\n", r);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x02);
+    snprintf(uart_buf, sizeof(uart_buf), "  EN_RXADDR  0x02 = 0x%02X  (expect 0x01)\r\n", r);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x05);
+    snprintf(uart_buf, sizeof(uart_buf), "  RF_CH      0x05 = %u   (expect 76)\r\n", r);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x06);
+    snprintf(uart_buf, sizeof(uart_buf), "  RF_SETUP   0x06 = 0x%02X  (expect 0x06)\r\n", r);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x07);
+    snprintf(uart_buf, sizeof(uart_buf), "  STATUS     0x07 = 0x%02X\r\n", r);
+    UART2_Print(uart_buf);
+
+    nrf24_ReadRegisterMulti(0x0A, addr, 5);
+    snprintf(uart_buf, sizeof(uart_buf), "  RX_ADDR_P0 0x0A = %02X:%02X:%02X:%02X:%02X  (expect E7 x5)\r\n",
+             addr[0], addr[1], addr[2], addr[3], addr[4]);
+    UART2_Print(uart_buf);
+
+    nrf24_ReadRegisterMulti(0x10, addr, 5);
+    snprintf(uart_buf, sizeof(uart_buf), "  TX_ADDR    0x10 = %02X:%02X:%02X:%02X:%02X  (expect E7 x5)\r\n",
+             addr[0], addr[1], addr[2], addr[3], addr[4]);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x11);
+    snprintf(uart_buf, sizeof(uart_buf), "  RX_PW_P0   0x11 = %u    (expect 4)\r\n", r);
+    UART2_Print(uart_buf);
+
+    r = nrf24_ReadRegister(0x17);
+    snprintf(uart_buf, sizeof(uart_buf), "  FIFO_STAT  0x17 = 0x%02X\r\n", r);
+    UART2_Print(uart_buf);
+
+    UART2_Print("-------------------------------\r\n");
+}
 
 /* USER CODE END 0 */
 
@@ -90,13 +182,44 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  
-  // Initialize NRF24L01 module
+
+  /* --- Peripheral init --- */
+  UART2_Init();
+
   nrf24_Init();
-  
-  // Test message to transmit
-  uint8_t test_message[] = "H";
-  uint8_t message_length = sizeof(test_message) - 1; // Exclude null terminator
+  nrf24_WriteRegister(0x01, 0x00); /* EN_AA       : disable auto-ack on all pipes */
+  nrf24_WriteRegister(0x04, 0x00); /* SETUP_RETR  : no retransmissions            */
+
+#if NRF24_TEST_MODE_RX
+  /* ---- RX mode ---- */
+  UART2_Print("\r\nNRF24L01+ RX Test\r\n");
+  /* Enable pipe 0, set its payload width to 4 bytes */
+  nrf24_WriteRegister(0x02, 0x01); /* EN_RXADDR   : enable pipe 0 */
+  nrf24_WriteRegister(0x11, 0x04); /* RX_PW_P0    : 4-byte payload */
+  nrf24_FlushRX();                 /* Clear any stale data in RX FIFO */
+  nrf24_ClearIRQFlags();           /* Clear any stale interrupt flags */
+  nrf24_SetRXTXMode(true);         /* PRIM_RX=1, CE high -> listening */
+#else
+  /* ---- TX mode ---- */
+  UART2_Print("\r\nNRF24L01+ TX Test\r\n");
+  nrf24_SetRXTXMode(false);        /* PRIM_RX=0, CE low -> standby */
+#endif
+
+  /* Print startup configuration */
+  uint8_t cfg      = nrf24_ReadRegister(0x00); /* CONFIG    */
+  uint8_t rf_setup = nrf24_ReadRegister(0x06); /* RF_SETUP  */
+  uint8_t rf_ch    = nrf24_ReadRegister(0x05); /* RF_CH     */
+  snprintf(uart_buf, sizeof(uart_buf),
+           "CONFIG=0x%02X RF_SETUP=0x%02X CH=%u (2.%03uGHz)\r\n",
+           cfg, rf_setup, (unsigned)rf_ch, 400u + (unsigned)rf_ch);
+  UART2_Print(uart_buf);
+#if NRF24_TEST_MODE_RX
+  UART2_Print("Listening for 4-byte packets...\r\n");
+#else
+  UART2_Print("Sending a 4-byte packet every 500 ms...\r\n");
+#endif
+
+  nrf24_PrintRegisters();
 
   /* USER CODE END 2 */
 
@@ -107,20 +230,74 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    
-    // Ensure CE is low before loading payload
-    HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_RESET);
-    
-    // Transmit the test message (loads payload into TX FIFO)
-    nrf24_Transmit(test_message, message_length);
-    
-    // Pulse CE high for at least 10µs to start transmission
-    HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_SET);
-    HAL_Delay(0.1); // Hold high for 1ms (much longer than required 10µs)
-    HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_RESET);
-    
-    // Wait before next transmission
-    //HAL_Delay(100); // 100ms delay between transmissions for easier spectrum analysis
+
+#if NRF24_TEST_MODE_RX
+    /* ---- RX loop ---- */
+
+    /* Heartbeat every 3 s: proves the loop is running and SPI still works.
+       STATUS=0x0E/0x0F = module alive.  STATUS=0xFF = SPI fault. */
+    static uint32_t last_hb = 0;
+    if (HAL_GetTick() - last_hb >= 3000U) {
+        last_hb = HAL_GetTick();
+        uint8_t hb_s = nrf24_ReadRegister(0x07);
+        uint8_t hb_f = nrf24_ReadRegister(0x17);
+        snprintf(uart_buf, sizeof(uart_buf),
+                 "[HB] STATUS=0x%02X FIFO=0x%02X rx_count=%lu\r\n",
+                 hb_s, hb_f, (unsigned long)rx_count);
+        UART2_Print(uart_buf);
+    }
+
+    if (nrf24_dataReady()) {
+        uint8_t rx_buf[4] = {0};
+        nrf24_Receive(rx_buf, sizeof(rx_buf));
+        nrf24_ClearIRQFlags();
+
+        snprintf(uart_buf, sizeof(uart_buf),
+                 "RX#%lu bytes=[%02X %02X %02X %02X]\r\n",
+                 (unsigned long)rx_count,
+                 rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+        UART2_Print(uart_buf);
+        rx_count++;
+    }
+#else
+    /* ---- TX loop ---- */
+    /* Build 4-byte payload: sync byte + 24-bit counter
+       Visible on oscilloscope as repeating SPI bursts every 500 ms.
+       Visible on spectrum analyser as GFSK packets at 2.476 GHz (CH 76). */
+    uint8_t payload[4] = {
+        0xAA,                                   /* fixed sync byte          */
+        (uint8_t)((tx_count >> 16) & 0xFFU),    /* counter high byte        */
+        (uint8_t)((tx_count >>  8) & 0xFFU),    /* counter mid byte         */
+        (uint8_t)( tx_count        & 0xFFU)     /* counter low byte         */
+    };
+
+    nrf24_Transmit(payload, sizeof(payload));
+
+    /* Allow time for the packet to leave the air (~320 µs at 1 Mbps) */
+    HAL_Delay(5);
+
+    /* Read STATUS (0x07) and FIFO_STATUS (0x17) for diagnostics */
+    uint8_t status      = nrf24_ReadRegister(0x07);
+    uint8_t fifo_status = nrf24_ReadRegister(0x17);
+
+    snprintf(uart_buf, sizeof(uart_buf),
+             "TX#%lu STATUS=0x%02X FIFO=0x%02X",
+             (unsigned long)tx_count, (unsigned)status, (unsigned)fifo_status);
+    UART2_Print(uart_buf);
+
+    if (status & 0x20U) {          /* bit 5 = TX_DS: packet sent successfully */
+        UART2_Print(" [TX_DS OK]\r\n");
+    } else if (status & 0x10U) {   /* bit 4 = MAX_RT: retransmit limit hit    */
+        UART2_Print(" [MAX_RT - check wiring]\r\n");
+    } else {
+        UART2_Print(" [no IRQ flag set]\r\n");
+    }
+
+    nrf24_ClearIRQFlags();
+    tx_count++;
+
+    HAL_Delay(495); /* ~500 ms period total (5 ms wait + 495 ms idle) */
+#endif
   }
   /* USER CODE END 3 */
 }

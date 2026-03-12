@@ -17,10 +17,16 @@ void nrf24_Init(void){
   HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_RESET); //CE low
   HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET); //CSN high
   
-  HAL_Delay(100); // Wait for NRF24L01 to power up
-  
-  // Configure CONFIG register: Power up, TX mode, CRC enabled
-  nrf24_WriteRegister(0x00, 0x0E); // PWR_UP=1, PRIM_RX=0 (TX), EN_CRC=1, CRCO=1 (2-byte CRC)
+  HAL_Delay(100); // Wait for NRF24L01 to power up (Tpwr_on = 100 ms max)
+
+  // Clear any stale IRQ flags before touching CONFIG (avoids SPI status corruption on clones)
+  nrf24_WriteRegister(0x07, 0x70);
+
+  // Configure CONFIG register: Power up, TX mode, 2-byte CRC enabled
+  // PWR_UP=1(bit1), EN_CRC=1(bit3), CRCO=1(bit2), PRIM_RX=0(bit0) -> 0x0E
+  nrf24_WriteRegister(0x00, 0x0E);
+
+  HAL_Delay(2); // Wait Tpd2stby (1.5 ms min) for transition from power-down to standby-I
   
   // Set TX address (5 bytes)
   HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET);
@@ -54,12 +60,21 @@ void nrf24_Init(void){
 //Reads register from nrf24l01
 uint8_t nrf24_ReadRegister(uint8_t reg){
   uint8_t data;
-  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET); //Pull CSN low to start communication
-  uint8_t command = reg & 0x1F; //The first 5 bits of the command are the register address, the last 3 bits are 0 for read operation
-  HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY); //Send the command
-  HAL_SPI_Receive(&nrf24_SPI, &data, 1, HAL_MAX_DELAY); //Read the data
-  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET); //Pull CSN high to end communication
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET);
+  uint8_t command = reg & 0x1F;
+  HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY);
+  HAL_SPI_Receive(&nrf24_SPI, &data, 1, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET);
   return data;
+}
+
+//Reads a multi-byte register (e.g. 5-byte addresses) from nrf24l01
+void nrf24_ReadRegisterMulti(uint8_t reg, uint8_t* data, uint8_t length){
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET);
+  uint8_t command = reg & 0x1F;
+  HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY);
+  HAL_SPI_Receive(&nrf24_SPI, data, length, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET);
 }
 
 //Writes data to register of nrf24l01
@@ -71,13 +86,34 @@ void nrf24_WriteRegister(uint8_t reg, uint8_t data){
   HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET); //Pull CSN high to end communication
 }
 
-//Transmits message stroed in data with length of length
-void nrf24_Transmit(uint8_t* data, uint8_t length) {
+void nrf24_FlushTX() {
   HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET); //Pull CSN low to start communication
-  uint8_t command = 0xA0; //The command for writing payload is 0xA0
+  uint8_t command = 0xE1; //The command for flushing TX FIFO is 0xE1
   HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY); //Send the command
-  HAL_SPI_Transmit(&nrf24_SPI, data, length, HAL_MAX_DELAY); //Send the data
   HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET); //Pull CSN high to end communication
+}
+
+void nrf24_ClearIRQFlags() {
+  // Clear RX_DR, TX_DS, and MAX_RT flags by writing 1 to them in the STATUS register (0x07)
+  nrf24_WriteRegister(0x07, 0x70); // 0x70 = 0b01110000 (sets bits 4, 5, and 6 to clear the flags)
+}
+
+//Transmits message stored in data with length of length
+void nrf24_Transmit(uint8_t* data, uint8_t length) {
+  // Flush TX FIFO before loading new payload
+  nrf24_FlushTX();
+
+  // Load payload into TX FIFO (CSN must bracket the SPI transaction)
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET);
+  uint8_t command = 0xA0; // W_TX_PAYLOAD
+  HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY);
+  HAL_SPI_Transmit(&nrf24_SPI, data, length, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET);
+
+  // Pulse CE HIGH for > 10µs to trigger transmission, then return to standby
+  HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_SET);
+  HAL_Delay(1); // 1 ms >> 10 µs minimum requirement
+  HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_RESET);
 }
 
 //Receives message and stores it in data with length of length. Returns true if message is received, false otherwise
@@ -100,15 +136,27 @@ void nrf24_SetRetransmission(uint8_t delay, uint8_t count) {
   nrf24_WriteRegister(0x04, value); //Write the value to the SETUP_RETR register
 }
 
+//Clears received data from the RX FIFO by flushing it
+void nrf24_FlushRX() {
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_RESET); //Pull CSN low to start communication
+  uint8_t command = 0xE2; //The command for flushing RX FIFO is 0xE2
+  HAL_SPI_Transmit(&nrf24_SPI, &command, 1, HAL_MAX_DELAY); //Send the command
+  HAL_GPIO_WritePin(NRF24_CSN_GPIO_Port, NRF24_CSN_Pin, GPIO_PIN_SET); //Pull CSN high to end communication
+}
+
 //Sets the nrf24l01 to RX mode if rx is true, and to TX mode if rx is false
 void nrf24_SetRXTXMode(bool rx)  {
   uint8_t value = nrf24_ReadRegister(0x00); //Read the current value of the CONFIG register (0x00)
   if (rx) {
     value |= 0x01; //Set the PRIM_RX bit (bit 0) for RX mode
+    nrf24_WriteRegister(0x00, value); //Write CONFIG first so PRIM_RX=1 before CE goes high
+    HAL_Delay(2); //Wait Tpd2stby (1.5 ms min) for the module to reach standby-I
+    HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_SET); //CE high -> enter RX mode
   } else {
+    HAL_GPIO_WritePin(NRF24_CE_GPIO_Port, NRF24_CE_Pin, GPIO_PIN_RESET); //CE low -> leave RX/TX mode
     value &= 0xFE; //Clear the PRIM_RX bit (bit 0) for TX mode
+    nrf24_WriteRegister(0x00, value); //Write the modified value back to the CONFIG register
   }
-  nrf24_WriteRegister(0x00, value); //Write the modified value back to the CONFIG register
 }
 
 //0 for 1Mbps, 1 for 2Mbps
@@ -117,6 +165,8 @@ void nrf24_SetDataRate(uint8_t dataRate) {
   value &= 0xD7; //Clear the RF_DR bits (bits 3 and 5) in the value
   if (dataRate == 1) {
     value |= 0x08; //Set the RF_DR bit (bit 3) for 2Mbps data rate
+    //Clear the interrupts to prevent them from being triggered by the change in data rate
+    nrf24_ClearIRQFlags();
   }
   nrf24_WriteRegister(0x06, value); //Write the modified value back to the RF_SETUP register
 }

@@ -19,6 +19,7 @@
 
 void nrf24_Init(void); //Initialize the nrf24l01 module
 uint8_t nrf24_ReadRegister(uint8_t reg); //Read register from nrf24l01
+void nrf24_ReadRegisterMulti(uint8_t reg, uint8_t* data, uint8_t length); //Read multi-byte register
 void nrf24_WriteRegister(uint8_t reg, uint8_t data); //Write data to register of nrf24l01
 void nrf24_Transmit(uint8_t* data, uint8_t length); //Transmits message stored in data with length of length
 bool nrf24_Receive(uint8_t* data, uint8_t length); //Receives message and stores it in data with length of length. Returns true if message is received, false otherwise
@@ -28,5 +29,6 @@ void nrf24_SetPowerLevel(uint8_t powerLevel); //0 for -18dBm, 1 for -12dBm, 2 fo
 void nrf24_SetRetransmission(uint8_t delay, uint8_t count); //Sets the retransmission settings. The delay is between 0 and 15 (in multiples of 250µs), and the count is between 0 and 15 (number of retransmissions)
 void nrf24_SetRXTXMode(bool rx); //Sets the nrf24l01 to RX mode if rx is true, and to TX mode if rx is false
 bool nrf24_dataReady(void); //Returns true if data is ready to be read, false otherwise
-
+void nrf24_ClearIRQFlags(void); //Clears the IRQ flags by writing 1 to them in the STATUS register
+void nrf24_FlushRX(void); //Flushes the RX FIFO
 #endif /* __NRF24_H__ */
