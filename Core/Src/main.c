@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Drone Receiver - NRF24L01 to UART Bridge
   ******************************************************************************
   * @attention
   *
@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "i2c.h"
 #include "spi.h"
 #include "gpio.h"
 
@@ -32,13 +34,33 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct {
+    uint8_t command;        // Command type
+    uint32_t data;          // Command data (32-bit)
+} uart_command_t;
+
+typedef struct {
+    uint8_t messages[TX_BUFFER_SIZE][TX_MESSAGE_SIZE];  // TX message buffer
+    uint8_t count;                                      // Number of messages queued
+} tx_buffer_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* Set to 0 for TX test mode, 1 for RX test mode */
-#define NRF24_TEST_MODE_RX  1
+#define MAX_PAYLOAD_SIZE    32      // Maximum NRF24L01 payload size
+#define UART_BUFFER_SIZE    128     // UART output buffer size
+#define RF_CHANNEL          76      // RF channel (2.476 GHz)
+#define PAYLOAD_SIZE        32      // Expected payload size
+
+// UART Command Protocol
+#define UART_CMD_SIZE       5       // Command size: 1 byte cmd + 4 bytes data
+#define UART_RX_TIMEOUT     10      // UART receive timeout in ms
+
+// NRF24L01 TX Buffer
+#define TX_BUFFER_SIZE      3       // Maximum 3 messages in TX buffer
+#define TX_MESSAGE_SIZE     32      // Each message is 32 bytes
 
 /* USER CODE END PD */
 
@@ -50,103 +72,293 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static char     uart_buf[80];
+static char uart_buf[UART_BUFFER_SIZE];
+static uint32_t message_count = 0;
+static uint32_t command_count = 0;
 static uint32_t tx_count = 0;
-static uint32_t rx_count = 0;
+static uint8_t uart_rx_buffer[UART_CMD_SIZE];
+static tx_buffer_t tx_buffer = {0};  // TX buffer for outgoing messages
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static void NRF24_Configure(void);
+static void ProcessReceivedMessage(uint8_t *data, uint8_t length);
+static void UART_EnableRX(void);
+static bool UART_ReadCommand(uart_command_t *cmd);
+static void ProcessUARTCommand(uart_command_t *cmd);
+static bool TX_QueueMessage(uint8_t *data, uint8_t length);
+static void TX_SendAllMessages(void);
+static void NRF24_SwitchToTX(void);
+static void NRF24_SwitchToRX(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* --- Minimal UART2 driver (direct register access, no HAL UART required) --- */
-/* PA2 = USART2_TX (AF7), PA3 = USART2_RX (AF7) — already configured by MX_GPIO_Init */
-static void UART2_Init(void)
+/**
+ * @brief Configure NRF24L01 for receiving
+ */
+static void NRF24_Configure(void)
 {
-    /* Enable USART2 peripheral clock (PCLK1 = 170 MHz) */
-    RCC->APB1ENR1 |= RCC_APB1ENR1_USART2EN;
-    USART2->CR1 = 0;
-    USART2->CR2 = 0;
-    USART2->CR3 = 0;
-    /* BRR = PCLK1 / BaudRate = 170 000 000 / 115 200 ≈ 1477 */
-    USART2->BRR = 1477U;
-    /* Enable TX and USART */
-    USART2->CR1 = USART_CR1_TE | USART_CR1_UE;
+    // Initialize NRF24L01
+    nrf24_Init();
+    
+    // Set RF channel
+    nrf24_SetChannel(RF_CHANNEL);
+    
+    // Set data rate to 1Mbps (0=250kbps, 1=1Mbps, 2=2Mbps)
+    nrf24_SetDataRate(1);
+    
+    // Set power level to maximum (0=-18dBm, 1=-12dBm, 2=-6dBm, 3=0dBm)
+    nrf24_SetPowerLevel(3);
+    
+    // Disable auto-acknowledgment for all pipes
+    nrf24_WriteRegister(0x01, 0x00);
+    
+    // Enable only pipe 0
+    nrf24_WriteRegister(0x02, 0x01);
+    
+    // Set payload width for pipe 0
+    nrf24_WriteRegister(0x11, PAYLOAD_SIZE);
+    
+    // Clear any pending interrupts and flush RX FIFO
+    nrf24_ClearIRQFlags();
+    nrf24_FlushRX();
+    
+    // Set to RX mode and start listening
+    nrf24_SetRXTXMode(true);
 }
 
-static void UART2_Print(const char *str)
+/**
+ * @brief Process and forward received message over UART using printf
+ */
+static void ProcessReceivedMessage(uint8_t *data, uint8_t length)
 {
-    while (*str) {
-        while (!(USART2->ISR & USART_ISR_TXE_TXFNF));
-        USART2->TDR = (uint8_t)(*str++);
+    message_count++;
+    
+    // Send message header and data in hex format
+    printf("[MSG_%lu] ", (unsigned long)message_count);
+    
+    // Print data as hex bytes
+    for (uint8_t i = 0; i < length; i++) {
+        printf("%02X", data[i]);
+        if (i < length - 1) printf(" ");
+    }
+    
+    // Print data as ASCII (if printable)
+    printf(" | ");
+    for (uint8_t i = 0; i < length; i++) {
+        if (data[i] >= 32 && data[i] <= 126) {
+            printf("%c", data[i]);
+        } else {
+            printf(".");
+        }
+    }
+    printf("\r\n");
+}
+
+/**
+ * @brief Enable UART2 RX functionality
+ * @note Assumes UART2 is already configured by the HAL/CubeMX
+ */
+static void UART_EnableRX(void)
+{
+    // Enable USART2 peripheral clock if not already enabled
+    RCC->APB1ENR1 |= RCC_APB1ENR1_USART2EN;
+    
+    // Ensure RX is enabled (should already be from CubeMX config)
+    USART2->CR1 |= USART_CR1_RE;
+}
+
+/**
+ * @brief Read a complete UART command (non-blocking)
+ * @param cmd Pointer to store the parsed command
+ * @return true if complete command received, false otherwise
+ */
+static bool UART_ReadCommand(uart_command_t *cmd)
+{
+    static uint8_t rx_index = 0;
+    static uint32_t last_rx_time = 0;
+    uint32_t current_time = HAL_GetTick();
+    
+    // Reset buffer if timeout occurred (incomplete command)
+    if (rx_index > 0 && (current_time - last_rx_time) > UART_RX_TIMEOUT) {
+        rx_index = 0;
+        printf("UART: Command timeout, buffer reset\r\n");
+    }
+    
+    // Check if data is available
+    while ((USART2->ISR & USART_ISR_RXNE_RXFNE) && rx_index < UART_CMD_SIZE) {
+        uart_rx_buffer[rx_index] = (uint8_t)(USART2->RDR);
+        rx_index++;
+        last_rx_time = current_time;
+        
+        // Check if we have a complete command
+        if (rx_index >= UART_CMD_SIZE) {
+            // Parse the command: first byte is command, next 4 bytes are data (little-endian)
+            cmd->command = uart_rx_buffer[0];
+            cmd->data = ((uint32_t)uart_rx_buffer[4] << 24) |
+                       ((uint32_t)uart_rx_buffer[3] << 16) |
+                       ((uint32_t)uart_rx_buffer[2] << 8)  |
+                       ((uint32_t)uart_rx_buffer[1]);
+            
+            rx_index = 0;  // Reset for next command
+            return true;
+        }
+    }
+    
+    return false;  // Command not complete yet
+}
+
+/**
+ * @brief Process received UART command
+ * @param cmd Pointer to the received command
+ */
+static void ProcessUARTCommand(uart_command_t *cmd)
+{
+    command_count++;
+    
+    printf("[CMD_%lu] Type: 0x%02X, Data: 0x%08lX (%lu)\r\n",
+           (unsigned long)command_count,
+           cmd->command,
+           (unsigned long)cmd->data,
+           (unsigned long)cmd->data);
+    
+    // Create a 32-byte message to send to the drone
+    uint8_t tx_message[TX_MESSAGE_SIZE] = {0};
+    
+    // Format: [CMD][DATA_3][DATA_2][DATA_1][DATA_0][RESERVED...]
+    tx_message[0] = cmd->command;
+    tx_message[1] = (uint8_t)(cmd->data & 0xFF);         // LSB
+    tx_message[2] = (uint8_t)((cmd->data >> 8) & 0xFF);
+    tx_message[3] = (uint8_t)((cmd->data >> 16) & 0xFF);
+    tx_message[4] = (uint8_t)((cmd->data >> 24) & 0xFF); // MSB
+    
+    // Queue the message for transmission
+    if (TX_QueueMessage(tx_message, TX_MESSAGE_SIZE)) {
+        printf("  -> Command queued for transmission\r\n");
+    } else {
+        printf("  -> TX buffer full! Command dropped\r\n");
+    }
+    
+    // TODO: Implement specific command handling
+    switch (cmd->command) {
+        case 0x01:
+            printf("  -> Command 0x01: Reserved for future use\r\n");
+            break;
+        case 0x02:
+            printf("  -> Command 0x02: Reserved for future use\r\n");
+            break;
+        // Add more command types here as needed
+        default:
+            printf("  -> Unknown command type\r\n");
+            break;
     }
 }
 
-/* Redirect printf → USART2 via newlib weak hook */
-int __io_putchar(int ch)
+/**
+ * @brief Queue a message for transmission
+ * @param data Pointer to the data to send
+ * @param length Length of the data (should be TX_MESSAGE_SIZE)
+ * @return true if queued successfully, false if buffer is full
+ */
+static bool TX_QueueMessage(uint8_t *data, uint8_t length)
 {
-    while (!(USART2->ISR & USART_ISR_TXE_TXFNF));
-    USART2->TDR = (uint8_t)ch;
-    return ch;
+    if (tx_buffer.count >= TX_BUFFER_SIZE) {
+        return false;  // Buffer is full
+    }
+    
+    // Copy message to buffer
+    if (length > TX_MESSAGE_SIZE) {
+        length = TX_MESSAGE_SIZE;  // Truncate if too long
+    }
+    
+    memcpy(tx_buffer.messages[tx_buffer.count], data, length);
+    
+    // Pad with zeros if message is shorter than TX_MESSAGE_SIZE
+    if (length < TX_MESSAGE_SIZE) {
+        memset(&tx_buffer.messages[tx_buffer.count][length], 0, TX_MESSAGE_SIZE - length);
+    }
+    
+    tx_buffer.count++;
+    return true;
 }
 
-/* Dump key nRF24L01+ registers to UART to verify SPI and config */
-static void nrf24_PrintRegisters(void)
+/**
+ * @brief Switch NRF24L01 to TX mode
+ */
+static void NRF24_SwitchToTX(void)
 {
-    uint8_t addr[5];
-    uint8_t r;
-    UART2_Print("--- nRF24L01+ register dump ---\r\n");
+    nrf24_SetRXTXMode(false);  // Set to TX mode (PRIM_RX=0, CE low)
+    // Small delay to ensure mode switch
+    HAL_Delay(1);
+}
 
-    r = nrf24_ReadRegister(0x00);
-    snprintf(uart_buf, sizeof(uart_buf), "  CONFIG     0x00 = 0x%02X", r);
-    UART2_Print(uart_buf);
-    if (r == 0xFF) UART2_Print(" !! 0xFF: SPI not responding - check wiring/VCC !!\r\n");
-    else           UART2_Print(" (0x0F=RX ok, 0x0E=TX ok)\r\n");
+/**
+ * @brief Switch NRF24L01 to RX mode
+ */
+static void NRF24_SwitchToRX(void)
+{
+    nrf24_SetRXTXMode(true);   // Set to RX mode (PRIM_RX=1, CE high)
+    // Small delay to ensure mode switch
+    HAL_Delay(1);
+}
 
-    r = nrf24_ReadRegister(0x01);
-    snprintf(uart_buf, sizeof(uart_buf), "  EN_AA      0x01 = 0x%02X  (expect 0x00)\r\n", r);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x02);
-    snprintf(uart_buf, sizeof(uart_buf), "  EN_RXADDR  0x02 = 0x%02X  (expect 0x01)\r\n", r);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x05);
-    snprintf(uart_buf, sizeof(uart_buf), "  RF_CH      0x05 = %u   (expect 76)\r\n", r);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x06);
-    snprintf(uart_buf, sizeof(uart_buf), "  RF_SETUP   0x06 = 0x%02X  (expect 0x06)\r\n", r);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x07);
-    snprintf(uart_buf, sizeof(uart_buf), "  STATUS     0x07 = 0x%02X\r\n", r);
-    UART2_Print(uart_buf);
-
-    nrf24_ReadRegisterMulti(0x0A, addr, 5);
-    snprintf(uart_buf, sizeof(uart_buf), "  RX_ADDR_P0 0x0A = %02X:%02X:%02X:%02X:%02X  (expect E7 x5)\r\n",
-             addr[0], addr[1], addr[2], addr[3], addr[4]);
-    UART2_Print(uart_buf);
-
-    nrf24_ReadRegisterMulti(0x10, addr, 5);
-    snprintf(uart_buf, sizeof(uart_buf), "  TX_ADDR    0x10 = %02X:%02X:%02X:%02X:%02X  (expect E7 x5)\r\n",
-             addr[0], addr[1], addr[2], addr[3], addr[4]);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x11);
-    snprintf(uart_buf, sizeof(uart_buf), "  RX_PW_P0   0x11 = %u    (expect 4)\r\n", r);
-    UART2_Print(uart_buf);
-
-    r = nrf24_ReadRegister(0x17);
-    snprintf(uart_buf, sizeof(uart_buf), "  FIFO_STAT  0x17 = 0x%02X\r\n", r);
-    UART2_Print(uart_buf);
-
-    UART2_Print("-------------------------------\r\n");
+/**
+ * @brief Send all queued messages and return to RX mode
+ */
+static void TX_SendAllMessages(void)
+{
+    if (tx_buffer.count == 0) {
+        return;  // Nothing to send
+    }
+    
+    printf("Sending %d queued message(s)...\r\n", tx_buffer.count);
+    
+    // Switch to TX mode
+    NRF24_SwitchToTX();
+    
+    // Send all queued messages
+    for (uint8_t i = 0; i < tx_buffer.count; i++) {
+        tx_count++;
+        
+        printf("[TX_%lu] Sending message %d/%d... ", 
+               (unsigned long)tx_count, i+1, tx_buffer.count);
+        
+        // Transmit the message
+        nrf24_Transmit(tx_buffer.messages[i], TX_MESSAGE_SIZE);
+        
+        // Wait a bit for transmission to complete
+        HAL_Delay(5);
+        
+        // Check transmission status
+        uint8_t status = nrf24_ReadRegister(0x07);  // STATUS register
+        if (status & 0x20) {  // TX_DS bit
+            printf("OK\r\n");
+        } else if (status & 0x10) {  // MAX_RT bit
+            printf("FAILED (Max retries)\r\n");
+        } else {
+            printf("UNKNOWN\r\n");
+        }
+        
+        // Clear interrupt flags
+        nrf24_ClearIRQFlags();
+        
+        // Small delay between messages
+        if (i < tx_buffer.count - 1) {
+            HAL_Delay(10);
+        }
+    }
+    
+    // Clear the TX buffer
+    tx_buffer.count = 0;
+    
+    // Switch back to RX mode
+    NRF24_SwitchToRX();
+    
+    printf("TX complete, returned to RX mode\r\n");
 }
 
 /* USER CODE END 0 */
@@ -157,7 +369,6 @@ static void nrf24_PrintRegisters(void)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -181,45 +392,36 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
+  MX_ADC2_Init();
+  MX_I2C1_Init();
+  
   /* USER CODE BEGIN 2 */
 
-  /* --- Peripheral init --- */
-  UART2_Init();
-
-  nrf24_Init();
-  nrf24_WriteRegister(0x01, 0x00); /* EN_AA       : disable auto-ack on all pipes */
-  nrf24_WriteRegister(0x04, 0x00); /* SETUP_RETR  : no retransmissions            */
-
-#if NRF24_TEST_MODE_RX
-  /* ---- RX mode ---- */
-  UART2_Print("\r\nNRF24L01+ RX Test\r\n");
-  /* Enable pipe 0, set its payload width to 4 bytes */
-  nrf24_WriteRegister(0x02, 0x01); /* EN_RXADDR   : enable pipe 0 */
-  nrf24_WriteRegister(0x11, 0x04); /* RX_PW_P0    : 4-byte payload */
-  nrf24_FlushRX();                 /* Clear any stale data in RX FIFO */
-  nrf24_ClearIRQFlags();           /* Clear any stale interrupt flags */
-  nrf24_SetRXTXMode(true);         /* PRIM_RX=1, CE high -> listening */
-#else
-  /* ---- TX mode ---- */
-  UART2_Print("\r\nNRF24L01+ TX Test\r\n");
-  nrf24_SetRXTXMode(false);        /* PRIM_RX=0, CE low -> standby */
-#endif
-
-  /* Print startup configuration */
-  uint8_t cfg      = nrf24_ReadRegister(0x00); /* CONFIG    */
-  uint8_t rf_setup = nrf24_ReadRegister(0x06); /* RF_SETUP  */
-  uint8_t rf_ch    = nrf24_ReadRegister(0x05); /* RF_CH     */
-  snprintf(uart_buf, sizeof(uart_buf),
-           "CONFIG=0x%02X RF_SETUP=0x%02X CH=%u (2.%03uGHz)\r\n",
-           cfg, rf_setup, (unsigned)rf_ch, 400u + (unsigned)rf_ch);
-  UART2_Print(uart_buf);
-#if NRF24_TEST_MODE_RX
-  UART2_Print("Listening for 4-byte packets...\r\n");
-#else
-  UART2_Print("Sending a 4-byte packet every 500 ms...\r\n");
-#endif
-
-  nrf24_PrintRegisters();
+  // Send startup message
+  printf("\r\n=== Drone Receiver Started ===\r\n");
+  printf("System Clock: %lu MHz\r\n", HAL_RCC_GetSysClockFreq() / 1000000);
+  
+  // Enable UART RX for command reception
+  UART_EnableRX();
+  
+  // Configure NRF24L01 for receiving
+  NRF24_Configure();
+  
+  // Verify NRF24L01 is responding
+  uint8_t config_reg = nrf24_ReadRegister(0x00);
+  if (config_reg == 0xFF) {
+    printf("ERROR: NRF24L01 not responding! Check wiring.\r\n");
+    while(1) {
+      HAL_Delay(1000);
+    }
+  }
+  
+  printf("NRF24L01 initialized successfully\r\n");
+  printf("RF Channel: %d (2.%03d GHz)\r\n", RF_CHANNEL, 400 + RF_CHANNEL);
+  printf("Payload Size: %d bytes\r\n", PAYLOAD_SIZE);
+  printf("UART Command Format: 1 byte cmd + 4 bytes data\r\n");
+  printf("TX Buffer: %d messages x %d bytes each\r\n", TX_BUFFER_SIZE, TX_MESSAGE_SIZE);
+  printf("Listening for NRF24L01 messages and UART commands...\r\n\r\n");
 
   /* USER CODE END 2 */
 
@@ -230,74 +432,42 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-#if NRF24_TEST_MODE_RX
-    /* ---- RX loop ---- */
-
-    /* Heartbeat every 3 s: proves the loop is running and SPI still works.
-       STATUS=0x0E/0x0F = module alive.  STATUS=0xFF = SPI fault. */
-    static uint32_t last_hb = 0;
-    if (HAL_GetTick() - last_hb >= 3000U) {
-        last_hb = HAL_GetTick();
-        uint8_t hb_s = nrf24_ReadRegister(0x07);
-        uint8_t hb_f = nrf24_ReadRegister(0x17);
-        snprintf(uart_buf, sizeof(uart_buf),
-                 "[HB] STATUS=0x%02X FIFO=0x%02X rx_count=%lu\r\n",
-                 hb_s, hb_f, (unsigned long)rx_count);
-        UART2_Print(uart_buf);
+    
+    // Priority 1: Check if data is available from NRF24L01
+    // Keep reading until FIFO is empty (up to 3 messages can be buffered)
+    while (nrf24_dataReady()) {
+      uint8_t rx_buffer[MAX_PAYLOAD_SIZE];
+      
+      // Receive the message
+      bool success = nrf24_Receive(rx_buffer, PAYLOAD_SIZE);
+      
+      if (success) {
+        // Process and forward the message over UART
+        ProcessReceivedMessage(rx_buffer, PAYLOAD_SIZE);
+      }
+      
+      // Clear interrupt flags after each message
+      nrf24_ClearIRQFlags();
     }
-
-    if (nrf24_dataReady()) {
-        uint8_t rx_buf[4] = {0};
-        nrf24_Receive(rx_buf, sizeof(rx_buf));
-        nrf24_ClearIRQFlags();
-
-        snprintf(uart_buf, sizeof(uart_buf),
-                 "RX#%lu bytes=[%02X %02X %02X %02X]\r\n",
-                 (unsigned long)rx_count,
-                 rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
-        UART2_Print(uart_buf);
-        rx_count++;
+    
+    // Priority 2: Check for UART commands
+    uart_command_t uart_cmd;
+    bool uart_command_received = false;
+    
+    // Process all available UART commands
+    while (UART_ReadCommand(&uart_cmd)) {
+      ProcessUARTCommand(&uart_cmd);
+      uart_command_received = true;
     }
-#else
-    /* ---- TX loop ---- */
-    /* Build 4-byte payload: sync byte + 24-bit counter
-       Visible on oscilloscope as repeating SPI bursts every 500 ms.
-       Visible on spectrum analyser as GFSK packets at 2.476 GHz (CH 76). */
-    uint8_t payload[4] = {
-        0xAA,                                   /* fixed sync byte          */
-        (uint8_t)((tx_count >> 16) & 0xFFU),    /* counter high byte        */
-        (uint8_t)((tx_count >>  8) & 0xFFU),    /* counter mid byte         */
-        (uint8_t)( tx_count        & 0xFFU)     /* counter low byte         */
-    };
-
-    nrf24_Transmit(payload, sizeof(payload));
-
-    /* Allow time for the packet to leave the air (~320 µs at 1 Mbps) */
-    HAL_Delay(5);
-
-    /* Read STATUS (0x07) and FIFO_STATUS (0x17) for diagnostics */
-    uint8_t status      = nrf24_ReadRegister(0x07);
-    uint8_t fifo_status = nrf24_ReadRegister(0x17);
-
-    snprintf(uart_buf, sizeof(uart_buf),
-             "TX#%lu STATUS=0x%02X FIFO=0x%02X",
-             (unsigned long)tx_count, (unsigned)status, (unsigned)fifo_status);
-    UART2_Print(uart_buf);
-
-    if (status & 0x20U) {          /* bit 5 = TX_DS: packet sent successfully */
-        UART2_Print(" [TX_DS OK]\r\n");
-    } else if (status & 0x10U) {   /* bit 4 = MAX_RT: retransmit limit hit    */
-        UART2_Print(" [MAX_RT - check wiring]\r\n");
-    } else {
-        UART2_Print(" [no IRQ flag set]\r\n");
+    
+    // Priority 3: Send queued TX messages if any UART commands were processed
+    if (uart_command_received && tx_buffer.count > 0) {
+      TX_SendAllMessages();
     }
-
-    nrf24_ClearIRQFlags();
-    tx_count++;
-
-    HAL_Delay(495); /* ~500 ms period total (5 ms wait + 495 ms idle) */
-#endif
+    
+    // Optional: Add a small delay to prevent excessive polling
+    // HAL_Delay(1);
+    
   }
   /* USER CODE END 3 */
 }

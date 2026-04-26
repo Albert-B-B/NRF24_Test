@@ -120,7 +120,7 @@
   *
   * @retval HAL status
   */
-HAL_StatusTypeDef HAL_RCCEx_PeriphCLKConfig(RCC_PeriphCLKInitTypeDef const *PeriphClkInit)
+HAL_StatusTypeDef HAL_RCCEx_PeriphCLKConfig(RCC_PeriphCLKInitTypeDef  *PeriphClkInit)
 {
   uint32_t tmpregister;
   uint32_t tickstart;
@@ -1405,7 +1405,7 @@ __weak void HAL_RCCEx_LSECSS_Callback(void)
   */
 void HAL_RCCEx_EnableLSCO(uint32_t LSCOSource)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef GPIO_InitStruct;
   FlagStatus       pwrclkchanged = RESET;
   FlagStatus       backupchanged = RESET;
 
@@ -1558,7 +1558,7 @@ void HAL_RCCEx_DisableLSCO(void)
   * @param  pInit Pointer on RCC_CRSInitTypeDef structure
   * @retval None
   */
-void HAL_RCCEx_CRSConfig(RCC_CRSInitTypeDef const *pInit)
+void HAL_RCCEx_CRSConfig(RCC_CRSInitTypeDef *pInit)
 {
   uint32_t value;
 
