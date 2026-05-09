@@ -29,6 +29,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/times.h>
+#include "stm32g4xx_hal.h"
 
 
 /* Variables */
@@ -87,6 +88,19 @@ __attribute__((weak)) int _write(int file, char *ptr, int len)
     __io_putchar(*ptr++);
   }
   return len;
+}
+
+int __io_putchar(int ch)
+{
+  while ((USART2->ISR & USART_ISR_TXE_TXFNF) == 0);
+  USART2->TDR = (uint8_t)ch;
+  return ch;
+}
+
+int __io_getchar(void)
+{
+  while ((USART2->ISR & USART_ISR_RXNE_RXFNE) == 0);
+  return (int)(USART2->RDR & 0xFF);
 }
 
 int _close(int file)

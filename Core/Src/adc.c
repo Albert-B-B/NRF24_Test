@@ -65,7 +65,7 @@ void MX_ADC2_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
@@ -109,7 +109,7 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     PA0     ------> ADC2_IN1
     PA1     ------> ADC2_IN2
     */
-    GPIO_InitStruct.Pin = JOY_X_Pin|JOY_Y_Pin;
+    GPIO_InitStruct.Pin = GPIO_PIN_0|JOY_Y_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -135,7 +135,7 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
     PA0     ------> ADC2_IN1
     PA1     ------> ADC2_IN2
     */
-    HAL_GPIO_DeInit(GPIOA, JOY_X_Pin|JOY_Y_Pin);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_0|JOY_Y_Pin);
 
   /* USER CODE BEGIN ADC2_MspDeInit 1 */
 
